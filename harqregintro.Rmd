@@ -1,0 +1,98 @@
+---
+title: "Implementation and testing the HAR-QREG model i R"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This R Markdown document will give a quick introduction on implementing the HAR-QREG model of [Haugom et al. (2016)](http://www.sciencedirect.com/science/article/pii/S1544612315001385) in R and backtesting the Value at Risk(VaR) predictions.
+Predicting VaR is essentially predicting quantiles and hence quantile regression is a natural choice when modelling VaR. The HAR-QREG model is a quantile regression model using short term, medium term and long term historical volatility (square root of 1 day, 5 days and 20 days average squared returns) as explanatory variables. This is of course heavily innspired by the HAR-RV model of [Corsi (2009)](https://www.scopus.com/record/display.uri?eid=2-s2.0-62849101579&origin=inward&txGid=a69b94b190edf2833685a89bf157a243).
+
+Beneath we will predict the 5 % quantile (VaR) on daily returns from the DAX index, using a rolling window of 1000 days.
+
+## Code
+For implementing and testing the model we only need to load/install to packages. The [GAS](https://www.rdocumentation.org/packages/GAS/versions/0.2.4) package has some nice financial data in adittion to implentation of the [Conditional Coverage test](https://www.jstor.org/stable/2527341?seq=1#page_scan_tab_contents) and the [Dynamic Quantile test](http://www.simonemanganelli.org/Simone/Research_files/caviarPublished.pdf). And of course the [quantreg](https://cran.r-project.org/web/packages/quantreg/index.html) package for quantile regression.
+
+```{r message = FALSE}
+library(GAS)
+library(quantreg)
+```
+
+Loading the data set *StockIndices*, from the GAS package, which includes almost 10 years of daily data for three European Stock indices.
+
+```{r}
+data("StockIndices")
+head(StockIndices)
+```
+
+We will continue with the DAX index in this example and proceed with creating the three explantory variabels with use of the [filter function](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/filter.html). Notice that by removing the last observation and include an *NA* in the beginning of the vectors, we get lagged observations. This means that the volatility estimates on a given row, is not estimated using the acctual return on that row.
+
+```{r}
+y <- StockIndices[, "DAX"]
+n <- length(y)
+
+# Make data frame with explanatory variabels
+df1 <- data.frame(y = y,
+                  sigma1 = c( NA, sqrt(y^2)[-n] ), # Square root of yesterdays squared return
+                  sigma5 = c( NA, sqrt(filter(y^2, rep(1/5, 5), sides = 1))[-n] ), # Square root of past 5 days average squared return
+                  sigma20 = c( NA, sqrt(filter(y^2, rep(1/20, 20), sides = 1))[-n] ) # Square root of past 20 days average squared return
+)
+
+head(df1, 25)
+```
+
+After removing the rows with missing observations we may estimate and predict 5% VaR with a rolling window of 1000 trading days within a for-loop. For comparisment we also include the empirical 5% quantile of the 1000-day window (often refferd to as historical simulation). 
+
+```{r}
+df1 <- na.omit(df1)
+N <- nrow(df1)
+# Rolling window one-day-ahead predictions with window of 1000 observations
+win_size <- 1000 # Window size
+pred0 <- numeric(N - win_size) # Historical quantiles
+pred1 <- numeric(N - win_size) # HAR-QREG model
+alpha <- 0.05 # Quantile to predict
+
+for(r in win_size:(N -1)){
+  rqfit <- rq(y ~ sigma1 + sigma5 + sigma20, data = df1[(r - win_size + 1):r, ], tau = alpha)
+  
+  pred0[r - win_size + 1] <- quantile(df1$y[(r - win_size + 1):r], probs = alpha)
+  pred1[r - win_size + 1] <- predict(rqfit, df1[r + 1, ])
+}
+
+# A matrix with asset return and predicted quantiles
+predmat <- cbind(Return = y[(win_size + 1):N], HS = pred0, HARQREG = pred1)
+head(predmat)
+```
+
+Above is the first row of a matrix containing the asset return together with the 5% VaR predictions of the Historical Simulation model and the HAR-QREG model. The historical quantiels are as expected more static in nature than the predictions from the HAR-QREG model which responds to the ever changing volatility. This might also be depicted in a plot.
+
+```{r}
+plot(as.Date(rownames(predmat)), predmat[, "Return"], type = "l", ylab = "Retun in %", xlab = "Date")
+lines(as.Date(rownames(predmat)), predmat[, "HS"], col = 2)
+lines(as.Date(rownames(predmat)), predmat[, "HARQREG"], col = 3)
+```
+
+The red line is the historical 5% quantile and the green line is the predicted 5% VaR from the HAR-QREG model.
+
+Finally we can use the [BacktestVaR function](https://www.rdocumentation.org/packages/GAS/versions/0.1.9/topics/BacktestVaR) to evaluate the predictions. We extract the P-values from the Conditional Coverage test and the Dynamic Quantile test. In both this tests the null-hypothesis is that the predicted quantiles are correct and that there is no dependence in wether the asset returns is above/bellow the predicted quantile. Hence a larger P-value gives us more confidence in the model. 
+
+Bellow the P-values are presented with a bar plot.
+```{r}
+btest0 <- BacktestVaR(data = predmat[, "Return"], VaR = predmat[, "HS"], alpha = alpha)
+btest1 <- BacktestVaR(data = predmat[, "Return"], VaR = predmat[, "HARQREG"], alpha = alpha)
+
+# A grafical presentation of P-values for Conditional Covareage test and Dynamic Quantile test
+pval0 <- c("CC" = unname(btest0$LRcc[2]), "DQ" = btest0$DQ$pvalue)
+pval1 <- c("CC" = unname(btest1$LRcc[2]), "DQ" = btest1$DQ$pvalue)
+
+barplot(c(pval0, pval1), ylim = c(0, 1), col = c(2,2,3,3), main = "P-values")
+abline(h = 0.05) # Illustrating a 5 % significance level
+legend("topleft", legend = c("Historical Simulation", "HAR-QREG"), text.col = c(2,3),
+       box.lty = 0)
+
+```
+
